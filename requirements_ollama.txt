@@ -1,0 +1,16 @@
+# LustLingual Ollama Backend Requirements
+
+# Core framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# HTTP client for Ollama communication
+httpx>=0.25.0
+
+# Data validation
+pydantic>=2.5.0
+
+# Optional: For production deployment
+python-multipart>=0.0.6
+python-jose[cryptography]>=3.3.0  # If adding JWT authentication
+passlib[bcrypt]>=1.7.4  # If adding user authentication
