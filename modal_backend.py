@@ -1,73 +1,93 @@
 """
-LustLingual Modal Backend - NSFW AI Chatbot with vLLM
+LustLingual Modal Backend - Using Ollama (Simple!)
 Deploy with: modal deploy modal_backend.py
 
-Features:
-- vLLM for fast inference with native streaming
-- dolphin-2.6-mixtral-8x7b (uncensored, NSFW-friendly)
-- SSE streaming support
-- Full CORS enabled
+Just like running locally - ollama pull && ollama run
 """
 
 import modal
 
 app = modal.App("lustlingual-backend")
 
-# vLLM-optimized image
+# Image with Ollama installed
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "vllm==0.6.3.post1",
-        "fastapi",
-        "pydantic",
-        "sse-starlette",
+    .apt_install("curl", "systemctl")
+    .run_commands(
+        "curl -fsSL https://ollama.com/install.sh | sh",
     )
+    .pip_install("fastapi", "pydantic", "httpx")
 )
 
-# Volume to cache model weights
-volume = modal.Volume.from_name("lustlingual-models", create_if_missing=True)
+# Volume to store Ollama models
+volume = modal.Volume.from_name("ollama-models", create_if_missing=True)
 
-# Model configuration
-MODEL_ID = "TheBloke/dolphin-2.6-mixtral-8x7b-AWQ"  # AWQ quantized for vLLM
+MODEL_NAME = "dolphin-mistral"  # Uncensored 7B - fast and good
 
 
 @app.cls(
     image=image,
-    gpu="A10G",  # 24GB VRAM
+    gpu="A10G",
     timeout=600,
-    scaledown_window=300,  # 5 minutes idle timeout
-    volumes={"/models": volume},
+    scaledown_window=300,
+    volumes={"/root/.ollama": volume},
 )
-@modal.concurrent(max_inputs=10)
-class LustLingualModel:
-    """vLLM-powered inference server"""
+class OllamaServer:
+    """Ollama server running on Modal"""
 
     @modal.enter()
-    def load_model(self):
-        """Load the model when container starts"""
-        from vllm import LLM, SamplingParams
+    def start_ollama(self):
+        """Start Ollama server and pull model"""
+        import subprocess
+        import time
+        import httpx
 
-        print(f"Loading model: {MODEL_ID}")
-        self.llm = LLM(
-            model=MODEL_ID,
-            download_dir="/models",
-            dtype="half",
-            max_model_len=4096,
-            gpu_memory_utilization=0.9,
-            trust_remote_code=True,
+        # Start Ollama server in background
+        print("Starting Ollama server...")
+        self.ollama_process = subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        self.sampling_params = SamplingParams(
-            temperature=0.8,
-            top_p=0.9,
-            top_k=50,
-            max_tokens=512,
-            repetition_penalty=1.1,
-        )
-        print("Model loaded successfully!")
 
-    def build_prompt(self, message: str, system_prompt: str = "", memory: str = "", conversation_history: list = None):
-        """Build ChatML format prompt"""
-        prompt_parts = []
+        # Wait for server to be ready
+        for _ in range(30):
+            try:
+                resp = httpx.get("http://localhost:11434/api/tags", timeout=2)
+                if resp.status_code == 200:
+                    print("Ollama server is ready!")
+                    break
+            except:
+                time.sleep(1)
+
+        # Pull model if not exists
+        print(f"Checking model: {MODEL_NAME}")
+        result = subprocess.run(
+            ["ollama", "pull", MODEL_NAME],
+            capture_output=True,
+            text=True,
+        )
+        print(result.stdout)
+        if result.returncode != 0:
+            print(f"Pull error: {result.stderr}")
+
+        print("Model ready!")
+
+    @modal.exit()
+    def stop_ollama(self):
+        """Stop Ollama server"""
+        if hasattr(self, 'ollama_process'):
+            self.ollama_process.terminate()
+
+    @modal.method()
+    def generate(self, message: str, system_prompt: str = "", memory: str = "",
+                 conversation_history: list = None, temperature: float = 0.8,
+                 max_tokens: int = 512) -> str:
+        """Generate response using Ollama"""
+        import httpx
+
+        # Build messages
+        messages = []
 
         # System prompt with memory
         full_system = system_prompt or ""
@@ -75,75 +95,41 @@ class LustLingualModel:
             full_system += f"\n\nMemory/Context:\n{memory}"
 
         if full_system:
-            prompt_parts.append(f"<|im_start|>system\n{full_system}<|im_end|>")
+            messages.append({"role": "system", "content": full_system})
 
-        # Conversation history (last 10 messages)
+        # Conversation history
         for msg in (conversation_history or [])[-10:]:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            prompt_parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+            messages.append({
+                "role": msg.get("role", "user"),
+                "content": msg.get("content", "")
+            })
 
         # Current message
-        prompt_parts.append(f"<|im_start|>user\n{message}<|im_end|>")
-        prompt_parts.append("<|im_start|>assistant\n")
+        messages.append({"role": "user", "content": message})
 
-        return "\n".join(prompt_parts)
-
-    @modal.method()
-    def generate(self, message: str, system_prompt: str = "", memory: str = "",
-                 conversation_history: list = None, temperature: float = 0.8,
-                 max_tokens: int = 512) -> str:
-        """Generate a response"""
-        from vllm import SamplingParams
-
-        prompt = self.build_prompt(message, system_prompt, memory, conversation_history)
-
-        params = SamplingParams(
-            temperature=temperature,
-            top_p=0.9,
-            top_k=50,
-            max_tokens=max_tokens,
-            repetition_penalty=1.1,
-            stop=["<|im_end|>", "<|im_start|>"],
+        # Call Ollama
+        response = httpx.post(
+            "http://localhost:11434/api/chat",
+            json={
+                "model": MODEL_NAME,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": max_tokens,
+                }
+            },
+            timeout=120.0,
         )
 
-        outputs = self.llm.generate([prompt], params)
-        response = outputs[0].outputs[0].text.strip()
+        if response.status_code != 200:
+            raise Exception(f"Ollama error: {response.text}")
 
-        # Clean up any remaining tokens
-        if "<|im_end|>" in response:
-            response = response.split("<|im_end|>")[0].strip()
-
-        return response
-
-    @modal.method()
-    def generate_stream(self, message: str, system_prompt: str = "", memory: str = "",
-                        conversation_history: list = None, temperature: float = 0.8,
-                        max_tokens: int = 512):
-        """Generate a streaming response"""
-        from vllm import SamplingParams
-
-        prompt = self.build_prompt(message, system_prompt, memory, conversation_history)
-
-        params = SamplingParams(
-            temperature=temperature,
-            top_p=0.9,
-            top_k=50,
-            max_tokens=max_tokens,
-            repetition_penalty=1.1,
-            stop=["<|im_end|>", "<|im_start|>"],
-        )
-
-        # Use vLLM's streaming
-        for output in self.llm.generate([prompt], params, use_tqdm=False):
-            text = output.outputs[0].text
-            if "<|im_end|>" in text:
-                text = text.split("<|im_end|>")[0]
-            yield text
+        return response.json()["message"]["content"]
 
 
-# Create a global reference to the model class
-model = LustLingualModel()
+# Global reference
+ollama = OllamaServer()
 
 
 @app.function(
@@ -153,7 +139,7 @@ model = LustLingualModel()
 )
 @modal.asgi_app()
 def fastapi_app():
-    """FastAPI app for LustLingual"""
+    """FastAPI app"""
     from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
@@ -163,7 +149,6 @@ def fastapi_app():
 
     web_app = FastAPI(title="LustLingual API")
 
-    # CORS - allow all origins for development
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -184,7 +169,7 @@ def fastapi_app():
         conversation_history: Optional[List[ChatMessage]] = []
         temperature: Optional[float] = 0.8
         max_tokens: Optional[int] = 512
-        model: Optional[str] = "dolphin-mixtral"
+        model: Optional[str] = "dolphin-mistral"
 
     class ChatResponse(BaseModel):
         response: str
@@ -194,33 +179,31 @@ def fastapi_app():
     async def root():
         return {
             "name": "LustLingual API",
-            "version": "2.0.0",
+            "version": "3.0.0",
             "status": "running",
-            "docs": "/docs",
-            "engine": "vLLM",
+            "engine": "Ollama",
+            "model": MODEL_NAME,
         }
 
     @web_app.get("/health")
     async def health():
         return {
             "status": "healthy",
-            "model": MODEL_ID,
-            "gpu": "A10G-24GB",
-            "ollama_status": "connected",  # For frontend compatibility
-            "available_models": ["dolphin-mixtral"],
-            "engine": "vLLM",
+            "model": MODEL_NAME,
+            "ollama_status": "connected",
+            "available_models": [MODEL_NAME],
         }
 
     @web_app.post("/chat", response_model=ChatResponse)
     async def chat(request: ChatRequest):
-        """Chat endpoint - non-streaming"""
+        """Chat endpoint"""
         try:
             history = [
                 {"role": msg.role, "content": msg.content}
                 for msg in (request.conversation_history or [])
             ]
 
-            response = model.generate.remote(
+            response = ollama.generate.remote(
                 message=request.message,
                 system_prompt=request.system_prompt or "",
                 memory=request.memory or "",
@@ -239,7 +222,7 @@ def fastapi_app():
 
     @web_app.post("/chat/stream")
     async def chat_stream(request: ChatRequest):
-        """Chat endpoint - Server-Sent Events streaming"""
+        """Streaming endpoint (simulated)"""
         try:
             history = [
                 {"role": msg.role, "content": msg.content}
@@ -247,36 +230,29 @@ def fastapi_app():
             ]
 
             async def event_generator():
-                prev_text = ""
                 try:
-                    for text in model.generate_stream.remote_gen(
+                    response = ollama.generate.remote(
                         message=request.message,
                         system_prompt=request.system_prompt or "",
                         memory=request.memory or "",
                         conversation_history=history,
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
-                    ):
-                        # Only yield new tokens
-                        new_text = text[len(prev_text):]
-                        if new_text:
-                            data = json.dumps({"token": new_text})
-                            yield f"data: {data}\n\n"
-                            prev_text = text
+                    )
 
-                    # Send done signal
+                    # Stream in chunks
+                    for i in range(0, len(response), 10):
+                        chunk = response[i:i + 10]
+                        yield f"data: {json.dumps({'token': chunk})}\n\n"
+
                     yield f"data: {json.dumps({'done': True})}\n\n"
+
                 except Exception as e:
                     yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
             return StreamingResponse(
                 event_generator(),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
             )
 
         except Exception as e:
@@ -284,15 +260,6 @@ def fastapi_app():
 
     @web_app.get("/models")
     async def list_models():
-        return {
-            "models": [
-                {
-                    "name": "dolphin-mixtral",
-                    "model": MODEL_ID,
-                    "size": "AWQ quantized (~26GB)",
-                    "engine": "vLLM",
-                }
-            ]
-        }
+        return {"models": [{"name": MODEL_NAME}]}
 
     return web_app
